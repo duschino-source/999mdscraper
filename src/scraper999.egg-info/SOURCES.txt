@@ -1,0 +1,12 @@
+README.md
+setup.py
+src/scraper999/__init__.py
+src/scraper999/api.py
+src/scraper999/cli.py
+src/scraper999/core.py
+src/scraper999.egg-info/PKG-INFO
+src/scraper999.egg-info/SOURCES.txt
+src/scraper999.egg-info/dependency_links.txt
+src/scraper999.egg-info/entry_points.txt
+src/scraper999.egg-info/requires.txt
+src/scraper999.egg-info/top_level.txt

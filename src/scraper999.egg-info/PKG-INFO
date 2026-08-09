@@ -1,0 +1,8 @@
+Metadata-Version: 2.4
+Name: scraper999
+Version: 1.0.0
+Requires-Dist: playwright>=1.45.1
+Requires-Dist: fastapi>=0.100.0
+Requires-Dist: uvicorn>=0.22.0
+Requires-Dist: pydantic>=2.0.0
+Dynamic: requires-dist
