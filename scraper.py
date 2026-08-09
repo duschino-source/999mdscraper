@@ -1,16 +1,21 @@
-import csv
-import time
+import asyncio
 import random
 import logging
 import os
 import sys
 import subprocess
-from playwright.sync_api import sync_playwright
+import argparse
+import sqlite3
+import re
+from datetime import datetime
+from playwright.async_api import async_playwright
 from playwright._impl._driver import compute_driver_executable
 
 # Force Playwright to use the global local appdata folder for browsers
 # instead of the temporary _MEI PyInstaller folder where it looks by default.
 os.environ["PLAYWRIGHT_BROWSERS_PATH"] = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "ms-playwright")
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 def ensure_chromium_installed():
     try:
@@ -20,109 +25,222 @@ def ensure_chromium_installed():
     except Exception as e:
         logging.warning(f"Could not auto-install chromium: {e}")
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+def init_db(db_path="scraper.db"):
+    """Initialize the SQLite database and return the connection."""
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS items (
+            url TEXT PRIMARY KEY,
+            title TEXT,
+            price INTEGER,
+            currency TEXT,
+            description TEXT,
+            date_added TEXT,
+            last_seen TEXT,
+            price_dropped INTEGER DEFAULT 0
+        )
+    ''')
+    conn.commit()
+    return conn
 
-def scrape_999_md(base_url, max_pages=999, output_file="video_cards.csv"):
-    results = []
+def parse_price(price_str):
+    """
+    Extracts raw integer price and currency from a string.
+    Returns (price_int, currency_str)
+    e.g. "2 000 lei" -> (2000, "MDL")
+         "300 €" -> (300, "EUR")
+    """
+    if not price_str or price_str == "N/A":
+        return None, None
+        
+    price_str_lower = price_str.lower()
+    
+    # Determine currency
+    currency = "Unknown"
+    if "lei" in price_str_lower or "mdl" in price_str_lower:
+        currency = "MDL"
+    elif "€" in price_str_lower or "eur" in price_str_lower:
+        currency = "EUR"
+    elif "$" in price_str_lower or "usd" in price_str_lower:
+        currency = "USD"
+        
+    # Extract all digits (removing spaces/commas used as thousands separators)
+    digits = re.sub(r'[^\d]', '', price_str)
+    price_val = int(digits) if digits else None
+    
+    return price_val, currency
+
+async def scrape_page(context, base_url, page_num, db_conn):
+    """Scrapes a single page and inserts results into SQLite."""
+    logging.info(f"Scraping page {page_num}...")
+    url = f"{base_url}?page={page_num}"
+    
+    page = await context.new_page()
+    found_on_page = 0
+    
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        # Wait for potential hydration and items to load
+        await page.wait_for_timeout(3000)
+        
+        # Find all <a> tags that link to specific items (not categories)
+        items = await page.locator('a[href*="/ro/"]:has(div), a[href*="/ro/"]:has(span), li a[href*="/ro/"]').all()
+        
+        extracted_items = []
+        for item in items:
+            href = await item.get_attribute("href")
+            # Exclude pagination, categories, menus, footer links, and boosted ads
+            if not href or any(x in href for x in ['/category/', '/list/', 'page=', '/info/', '/sitemap', '/blog', 'clickToken=']):
+                continue
+            
+            full_link = f"https://999.md{href}" if href.startswith('/') else href
+            text_content = (await item.inner_text()).strip()
+            
+            # Usually the text has newlines for different parts (Title\nPrice\netc.)
+            lines = [line.strip() for line in text_content.split('\n') if line.strip()]
+            
+            if len(lines) >= 1:
+                title = lines[0]
+                raw_price = "N/A"
+                description = "N/A"
+                
+                # Keyword filter to skip boosted/unrelated items
+                skip_keywords = [
+                    "laptop", "reparați", "reparati", "epson", "cartuș", "cartus", 
+                    "auto", "instalare", "windows", "macbook", "ps plus", 
+                    "eurogsm", "tablete", "ecrane", "birotică", "birotica",
+                    "ea play", "playstation", "xbox", "gamepad", "joystick",
+                    "aparat", "imprimant", "tv", "televizor", "servicii",
+                    "telefoane", "iphone", "samsung", "xiaomi", "nintendo"
+                ]
+                title_lower = title.lower()
+                if any(kw in title_lower for kw in skip_keywords):
+                    continue
+                
+                # Attempt to find price and description based on typical patterns
+                for line in lines[1:]:
+                    if "MDL" in line or "€" in line or "$" in line or "lei" in line.lower():
+                        raw_price = line
+                    elif len(line) > 15 and line != raw_price:
+                        description = line
+                
+                # Parse robust price
+                price_val, currency = parse_price(raw_price)
+                
+                extracted_items.append({
+                    "title": title,
+                    "price_val": price_val,
+                    "currency": currency,
+                    "description": description,
+                    "url": full_link
+                })
+        
+        # Deduplicate on the current page before inserting
+        unique_items = {item["url"]: item for item in extracted_items}.values()
+        
+        if not unique_items:
+            await page.close()
+            logging.warning(f"No valid items found on page {page_num}.")
+            return 0
+            
+        cursor = db_conn.cursor()
+        now_str = datetime.now().isoformat()
+        
+        for item in unique_items:
+            # Check if it exists to detect price drops
+            cursor.execute("SELECT price FROM items WHERE url = ?", (item['url'],))
+            row = cursor.fetchone()
+            
+            price_dropped = 0
+            if row and row[0] is not None and item['price_val'] is not None:
+                old_price = row[0]
+                if item['price_val'] < old_price:
+                    price_dropped = 1
+                    logging.info(f"PRICE DROP DETECTED! {item['title']} dropped from {old_price} to {item['price_val']} {item['currency']}")
+            elif row:
+                # Keep previous price_dropped status if it existed and didn't change
+                cursor.execute("SELECT price_dropped FROM items WHERE url = ?", (item['url'],))
+                price_dropped = cursor.fetchone()[0]
+
+            if not row:
+                # Insert new item
+                cursor.execute('''
+                    INSERT INTO items (url, title, price, currency, description, date_added, last_seen, price_dropped)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (item['url'], item['title'], item['price_val'], item['currency'], item['description'], now_str, now_str, price_dropped))
+            else:
+                # Update existing item
+                cursor.execute('''
+                    UPDATE items 
+                    SET title = ?, price = ?, currency = ?, description = ?, last_seen = ?, price_dropped = ?
+                    WHERE url = ?
+                ''', (item['title'], item['price_val'], item['currency'], item['description'], now_str, price_dropped, item['url']))
+                
+            found_on_page += 1
+            
+        db_conn.commit()
+        logging.info(f"Processed {found_on_page} items from page {page_num}.")
+        
+    except Exception as e:
+        logging.error(f"Error scraping page {page_num}: {e}")
+        
+    await page.close()
+    return found_on_page
+
+
+async def scrape_999_md_async(base_url, max_pages=999, concurrency=5):
     ensure_chromium_installed()
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        # Using a context with a standard user agent
-        context = browser.new_context(
+    db_conn = init_db()
+    
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        context = await browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
         )
-        page = context.new_page()
+        
+        semaphore = asyncio.Semaphore(concurrency)
+        
+        async def sem_scrape(page_num):
+            async with semaphore:
+                # Random delay to prevent hammering the server exactly at the same time
+                await asyncio.sleep(random.uniform(0.5, 2.0))
+                return await scrape_page(context, base_url, page_num, db_conn)
 
-        for current_page in range(1, max_pages + 1):
-            logging.info(f"Scraping page {current_page}...")
-            url = f"{base_url}?page={current_page}"
+        current_page = 1
+        while current_page <= max_pages:
+            # We process pages in chunks matching our concurrency limit
+            chunk_end = min(current_page + concurrency, max_pages + 1)
+            tasks = [sem_scrape(p) for p in range(current_page, chunk_end)]
             
-            try:
-                page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                # Wait for potential hydration and items to load
-                page.wait_for_timeout(3000)
-                
-                # In 999.md's new Next.js layout, the entire ad is often an <a> wrapper or a list item <li> 
-                # Let's find all <a> tags that link to specific items (not categories)
-                items = page.locator('a[href*="/ro/"]:has(div), a[href*="/ro/"]:has(span), li a[href*="/ro/"]').all()
-                
-                found_on_page = 0
-                for item in items:
-                    href = item.get_attribute("href")
-                    # Exclude pagination, categories, menus, footer links, and boosted ads
-                    if not href or any(x in href for x in ['/category/', '/list/', 'page=', '/info/', '/sitemap', '/blog', 'clickToken=']):
-                        continue
-                    
-                    full_link = f"https://999.md{href}" if href.startswith('/') else href
-                    text_content = item.inner_text().strip()
-                    
-                    # Usually the text has newlines for different parts (Title\nPrice\netc.)
-                    # Let's split by newline and extract
-                    lines = [line.strip() for line in text_content.split('\n') if line.strip()]
-                    
-                    if len(lines) >= 1:
-                        title = lines[0]
-                        price = "N/A"
-                        description = "N/A"
-                        
-                        # Keyword filter to skip boosted/unrelated items (like laptops, repairs, etc.)
-                        skip_keywords = [
-                            "laptop", "reparați", "reparati", "epson", "cartuș", "cartus", 
-                            "auto", "instalare", "windows", "macbook", "ps plus", 
-                            "eurogsm", "tablete", "ecrane", "birotică", "birotica",
-                            "ea play", "playstation", "xbox", "gamepad", "joystick",
-                            "aparat", "imprimant", "tv", "televizor", "servicii",
-                            "telefoane", "iphone", "samsung", "xiaomi", "nintendo"
-                        ]
-                        title_lower = title.lower()
-                        if any(kw in title_lower for kw in skip_keywords):
-                            continue
-                        
-                        # Attempt to find price and description based on typical patterns
-                        for line in lines[1:]:
-                            if "MDL" in line or "€" in line or "$" in line or "lei" in line.lower():
-                                price = line
-                            elif len(line) > 15 and line != price:
-                                description = line
-                        
-                        # To avoid duplicate extraction of same items (often there are multiple <a> pointing to same ad)
-                        if not any(r['Link'] == full_link for r in results):
-                            results.append({
-                                "Title": title,
-                                "Price": price,
-                                "Description": description,
-                                "Link": full_link
-                            })
-                            found_on_page += 1
-
-                logging.info(f"Found {found_on_page} items on page {current_page}.")
-                
-                if found_on_page == 0:
-                    logging.warning(f"No valid items found on page {current_page}. Stopping pagination.")
-                    break
-                    
-            except Exception as e:
-                logging.error(f"Error scraping page {current_page}: {e}")
+            results = await asyncio.gather(*tasks)
             
-            sleep_time = random.uniform(1, 3)
-            logging.info(f"Sleeping for {sleep_time:.2f} seconds...")
-            time.sleep(sleep_time)
+            # If any page in this chunk returned 0 items, we assume we've hit the end of pagination
+            if 0 in results:
+                logging.info("Hit an empty page. Stopping pagination early.")
+                break
+                
+            current_page = chunk_end
 
-        browser.close()
+        await browser.close()
+    db_conn.close()
 
-    if results:
-        try:
-            with open(output_file, mode="w", newline="", encoding="utf-8") as file:
-                writer = csv.DictWriter(file, fieldnames=["Title", "Price", "Description", "Link"])
-                writer.writeheader()
-                writer.writerows(results)
-            logging.info(f"Successfully saved {len(results)} items to '{output_file}'.")
-        except Exception as e:
-            logging.error(f"Failed to save data to CSV: {e}")
-    else:
-        logging.warning("No data was extracted to save.")
+def main():
+    parser = argparse.ArgumentParser(description="Advanced 999.md Web Scraper")
+    parser.add_argument("--url", type=str, default="https://999.md/ro/list/computers-and-office-equipment/video", 
+                        help="The base URL of the category to scrape.")
+    parser.add_argument("--pages", type=int, default=999, 
+                        help="Maximum number of pages to scrape.")
+    parser.add_argument("--concurrency", type=int, default=5, 
+                        help="Number of pages to scrape simultaneously (async).")
+    args = parser.parse_args()
+    
+    logging.info(f"Starting scraper for URL: {args.url}")
+    logging.info(f"Max Pages: {args.pages} | Concurrency: {args.concurrency}")
+    
+    asyncio.run(scrape_999_md_async(args.url, args.pages, args.concurrency))
+    
+    logging.info("Scraping complete! Data saved to scraper.db")
 
 if __name__ == "__main__":
-    target_url = "https://999.md/ro/list/computers-and-office-equipment/video"
-    scrape_999_md(base_url=target_url, max_pages=999, output_file="video_cards.csv")
+    main()
