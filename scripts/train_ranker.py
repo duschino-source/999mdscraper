@@ -1,6 +1,6 @@
 """QLoRA/DPO fine-tuning for the local smartphone listing ranker.
 
-Run from a Linux/WSL environment with a CUDA-enabled PyTorch installation.
+Run on Windows or Linux with a CUDA-enabled PyTorch installation.
 """
 
 import argparse
@@ -22,7 +22,7 @@ def main():
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
-        raise SystemExit("CUDA GPU not detected. Run this on the GTX 1080 Ti through Linux/WSL with NVIDIA CUDA enabled.")
+        raise SystemExit("CUDA GPU not detected. Install a CUDA-enabled PyTorch build for the GTX 1080 Ti.")
     if torch.cuda.get_device_properties(0).total_memory < 8 * 1024**3:
         raise SystemExit("At least 8 GB of GPU memory is recommended for this training preset.")
     if not Path(args.data).is_file():
@@ -65,11 +65,13 @@ def main():
         gradient_accumulation_steps=8,
         gradient_checkpointing=True,
         max_length=1024,
-        max_prompt_length=896,
         logging_steps=5,
         save_strategy="epoch",
         report_to="none",
-        fp16=True,
+        # Pascal (compute capability 6.1) has FP16 but no BF16 support.
+        # Keep AMP/scaling disabled; 4-bit base weights and FP16 matmuls still apply.
+        fp16=False,
+        bf16=False,
     )
     trainer = DPOTrainer(
         model=model,

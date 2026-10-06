@@ -59,10 +59,13 @@ python -m scraper999.cli --pages 2 --output listings.csv
 
 Экспорт использует сведения об объявлениях из базы парсера и включает профиль критериев. Это этап сбора данных, а не готовая обученная модель. GTX 1080 Ti с 11 ГБ видеопамяти может подойти для начала параметрически эффективной настройки компактной модели.
 
-Для дообучения модели Qwen 0.6B используйте Linux или WSL с NVIDIA CUDA. Установите сборку PyTorch с поддержкой CUDA для вашей системы, затем установите зависимости и запустите обучение:
+Для дообучения модели Qwen 0.6B на GTX 1080 Ti используйте отдельное окружение обучения. PyTorch 2.14 с CUDA 12.6 сохраняет поддержку Pascal; сначала установите его, затем остальные зависимости:
 
-    python -m pip install -e ".[training]"
-    python scripts/train_ranker.py --data preferences.jsonl
+    py -3.14 -m venv .venv-training
+    .\.venv-training\Scripts\python.exe -m pip install --upgrade pip
+    .\.venv-training\Scripts\python.exe -m pip install torch==2.14.0 --index-url https://download.pytorch.org/whl/cu126
+    .\.venv-training\Scripts\python.exe -m pip install -e ".[training]"
+    .\.venv-training\Scripts\python.exe scripts/train_ranker.py --data preferences.jsonl
 
 LoRA-адаптер будет сохранён в models/999-ranker. Скрипт не скачивает и не обучает модель, пока вы его не запустите.
 

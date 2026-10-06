@@ -1,4 +1,7 @@
 .venv/
+.venv-training/
+.cache/
+models/
 venv/
 __pycache__/
 *.py[cod]
@@ -8,6 +11,7 @@ dist/
 *.spec
 *.csv
 *.json
+*.jsonl
 !smartphone-criteria.json
 *.db
 *.db-shm

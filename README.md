@@ -59,10 +59,13 @@ Export the comparisons as DPO preference data for a later local fine-tuning run:
 
 The export uses listing details from the scraper database and embeds the criteria profile with each comparison. It is a data-collection step, not a trained model; the model should only be fine-tuned after you have accumulated useful choices. The GTX 1080 Ti has 11 GB VRAM, which is a plausible starting point for parameter-efficient fine-tuning of a compact model.
 
-To fine-tune the starter Qwen 0.6B model, use Linux or WSL with NVIDIA CUDA available. Install a CUDA-enabled PyTorch build for your system, then install the training extras and run:
+To fine-tune the starter Qwen 0.6B model on the GTX 1080 Ti, use the separate training environment. PyTorch 2.14 with CUDA 12.6 retains support for Pascal GPUs; install it first, then install the remaining training extras:
 
-    python -m pip install -e ".[training]"
-    python scripts/train_ranker.py --data preferences.jsonl
+    py -3.14 -m venv .venv-training
+    .\.venv-training\Scripts\python.exe -m pip install --upgrade pip
+    .\.venv-training\Scripts\python.exe -m pip install torch==2.14.0 --index-url https://download.pytorch.org/whl/cu126
+    .\.venv-training\Scripts\python.exe -m pip install -e ".[training]"
+    .\.venv-training\Scripts\python.exe scripts/train_ranker.py --data preferences.jsonl
 
 This saves a LoRA adapter under models/999-ranker. The training script does not download or train anything until you run it.
 

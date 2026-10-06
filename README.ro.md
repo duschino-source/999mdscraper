@@ -59,10 +59,13 @@ Exportați comparațiile în formatul DPO JSONL:
 
 Exportul folosește datele anunțurilor din baza scraper-ului și include profilul criteriilor. Aceasta este etapa de colectare a datelor, nu un model deja antrenat. GTX 1080 Ti are 11 GB VRAM și poate fi un punct de pornire pentru fine-tuning eficient al unui model compact.
 
-Pentru fine-tuning-ul modelului Qwen 0.6B, folosiți Linux sau WSL cu NVIDIA CUDA disponibil. Instalați o versiune PyTorch compatibilă cu CUDA pentru sistemul dvs., apoi instalați dependențele și porniți antrenarea:
+Pentru fine-tuning-ul modelului Qwen 0.6B pe GTX 1080 Ti, folosiți mediul separat de antrenare. PyTorch 2.14 cu CUDA 12.6 păstrează suportul pentru GPU-urile Pascal; instalați-l mai întâi, apoi restul dependențelor:
 
-    python -m pip install -e ".[training]"
-    python scripts/train_ranker.py --data preferences.jsonl
+    py -3.14 -m venv .venv-training
+    .\.venv-training\Scripts\python.exe -m pip install --upgrade pip
+    .\.venv-training\Scripts\python.exe -m pip install torch==2.14.0 --index-url https://download.pytorch.org/whl/cu126
+    .\.venv-training\Scripts\python.exe -m pip install -e ".[training]"
+    .\.venv-training\Scripts\python.exe scripts/train_ranker.py --data preferences.jsonl
 
 Adapterul LoRA va fi salvat în models/999-ranker. Scriptul nu descarcă și nu antrenează modelul până când nu îl porniți.
 

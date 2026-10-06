@@ -89,10 +89,11 @@ class PreferenceStore:
                 )
                 chosen_is_a = preference_id % 2 == 0
                 listing_a, listing_b = (preferred, other) if chosen_is_a else (other, preferred)
-                category = json.loads(criteria).get("category", "items")
+                profile = json.loads(criteria)
+                category = profile.get("category", "items")
                 prompt = {
                     "task": f"Choose the better {category} listing using the user's preset criteria.",
-                    "criteria": json.loads(criteria),
+                    "criteria": profile,
                     "listing_a": listing_a,
                     "listing_b": listing_b,
                     "instruction": "Reply with only A or B.",
