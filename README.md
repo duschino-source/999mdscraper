@@ -1,5 +1,7 @@
 # 999.md Scraper
 
+**Languages:** English · [Română](README.ro.md) · [Русский](README.ru.md)
+
 An asynchronous Playwright scraper for 999.md category listings. It keeps listing and price history in SQLite and exports each run to CSV or JSON.
 
 ## Requirements
@@ -35,7 +37,7 @@ To install the test and packaging tools as well, use `python -m pip install -e "
 
 The scraper follows the category pagination, up to 999 pages by default, and stops after two consecutive empty pages. It writes listing history to `scraper.db` and exports listings from all fetched pages to `listings.csv`. Use `--output listings.json` for JSON, `--pages N` to set a different page cap, `--db PATH` for a different database, and `--help` to see all options. The default concurrency is 3 pages.
 
-If you activated the virtual environment with `\.venv\Scripts\Activate.ps1`, you can run `999scraper` without the explicit path.
+If you activated the virtual environment with `.\.venv\Scripts\Activate.ps1`, you can run `999scraper` without the explicit path.
 
 You can also run it from a source checkout without installing the console command:
 
