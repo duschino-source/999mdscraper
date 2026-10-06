@@ -45,6 +45,33 @@ Puteți rula scraper-ul și din directorul sursă, fără instalarea comenzii:
 python -m scraper999.cli --pages 2 --output listings.csv
 ```
 
+## Pregătirea unui model local pentru anunțuri
+
+Primul profil este pentru **smartphone-uri** și compară prețul, performanța chipsetului și spațiul de stocare. Modificați smartphone-criteria.json înainte de a înregistra alegeri. Ponderile exprimă importanța fiecărui criteriu; limitele opționale permit stabilirea unui preț maxim sau a spațiului minim.
+
+După colectarea anunțurilor, comparați două anunțuri salvate și înregistrați-l pe cel preferat:
+
+    999scraper-preference record --chosen "https://999.md/ro/12345678" --rejected "https://999.md/ro/87654321" --reason "Chipset mai rapid pentru o diferență mică de preț"
+
+Exportați comparațiile în formatul DPO JSONL:
+
+    999scraper-preference export --output preferences.jsonl
+
+Exportul folosește datele anunțurilor din baza scraper-ului și include profilul criteriilor. Aceasta este etapa de colectare a datelor, nu un model deja antrenat. GTX 1080 Ti are 11 GB VRAM și poate fi un punct de pornire pentru fine-tuning eficient al unui model compact.
+
+Pentru fine-tuning-ul modelului Qwen 0.6B, folosiți Linux sau WSL cu NVIDIA CUDA disponibil. Instalați o versiune PyTorch compatibilă cu CUDA pentru sistemul dvs., apoi instalați dependențele și porniți antrenarea:
+
+    python -m pip install -e ".[training]"
+    python scripts/train_ranker.py --data preferences.jsonl
+
+Adapterul LoRA va fi salvat în models/999-ranker. Scriptul nu descarcă și nu antrenează modelul până când nu îl porniți.
+
+După antrenare, ordonați un export JSON folosind același profil:
+
+    python scripts/rank_listings.py --input listings.json --criteria smartphone-criteria.json --adapter models/999-ranker --output ranked-listings.json
+
+Clasificarea compară anunțurile în perechi, deci o categorie mare poate necesita timp.
+
 ## Rularea API-ului
 
 ```powershell

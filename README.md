@@ -45,6 +45,33 @@ You can also run it from a source checkout without installing the console comman
 python -m scraper999.cli --pages 2 --output listings.csv
 ```
 
+## Preparing a local listing model
+
+The first model profile targets **smartphones** and compares price, chipset performance, and storage. Adjust smartphone-criteria.json before collecting choices. The weights express the tradeoff between those criteria; the optional constraints let you set a maximum price or minimum storage.
+
+After scraping, compare two saved listings and record the one you prefer:
+
+    999scraper-preference record --chosen "https://999.md/ro/12345678" --rejected "https://999.md/ro/87654321" --reason "Faster chipset for a small price difference"
+
+Export the comparisons as DPO preference data for a later local fine-tuning run:
+
+    999scraper-preference export --output preferences.jsonl
+
+The export uses listing details from the scraper database and embeds the criteria profile with each comparison. It is a data-collection step, not a trained model; the model should only be fine-tuned after you have accumulated useful choices. The GTX 1080 Ti has 11 GB VRAM, which is a plausible starting point for parameter-efficient fine-tuning of a compact model.
+
+To fine-tune the starter Qwen 0.6B model, use Linux or WSL with NVIDIA CUDA available. Install a CUDA-enabled PyTorch build for your system, then install the training extras and run:
+
+    python -m pip install -e ".[training]"
+    python scripts/train_ranker.py --data preferences.jsonl
+
+This saves a LoRA adapter under models/999-ranker. The training script does not download or train anything until you run it.
+
+After training, rank a JSON scrape with the same profile:
+
+    python scripts/rank_listings.py --input listings.json --criteria smartphone-criteria.json --adapter models/999-ranker --output ranked-listings.json
+
+The ranker compares listings pairwise, so a large category can take time to process.
+
 ## Run the API
 
 ```powershell

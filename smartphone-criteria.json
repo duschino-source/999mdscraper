@@ -1,0 +1,15 @@
+{
+  "category": "smartphones",
+  "currency": "MDL",
+  "weights": {
+    "price": 0.4,
+    "performance": 0.4,
+    "storage": 0.2
+  },
+  "constraints": {
+    "max_price": null,
+    "min_storage_gb": null,
+    "min_condition": null
+  },
+  "notes": "Edit the weights and constraints before recording preferences. Weights should add up to 1."
+}
