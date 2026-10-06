@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scraper999"
+version = "2.1.0"
+description = "Async listing scraper for 999.md with SQLite price history"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["playwright>=1.45"]
+
+[project.optional-dependencies]
+api = ["fastapi>=0.110", "uvicorn[standard]>=0.27"]
+dev = ["build>=1.2", "pytest>=8"]
+
+[project.scripts]
+999scraper = "scraper999.cli:main"
+999scraper-api = "scraper999.api:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

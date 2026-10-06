@@ -1,200 +1,293 @@
+"""Browser-backed scraper and SQLite price history for 999.md."""
+
 import asyncio
-import random
 import logging
-import os
-import subprocess
-import sqlite3
+import random
 import re
-from datetime import datetime
+import sqlite3
+from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
+from pathlib import Path
+from urllib.parse import parse_qs, urljoin, urlparse
+
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
-from playwright._impl._driver import compute_driver_executable
 
-# Force Playwright to use the global local appdata folder for browsers
-os.environ["PLAYWRIGHT_BROWSERS_PATH"] = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "ms-playwright")
+logger = logging.getLogger(__name__)
+LISTING_HREF_RE = re.compile(r"^/ro/(\d+)(?:\?|$)")
+PRICE_NUMBER_RE = re.compile(r"(?<!\w)(\d[\d\s\u00a0\u202f.,'’]*\d|\d)")
+EMPTY_PAGE_LIMIT = 2
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 class Scraper999:
-    def __init__(self, db_path="scraper.db"):
-        self.db_path = db_path
-        self._ensure_chromium_installed()
-        self._init_db()
-
-    def _ensure_chromium_installed(self):
-        try:
-            node_exe, cli_js = compute_driver_executable()
-            subprocess.run([node_exe, cli_js, "install", "chromium"], capture_output=True)
-        except Exception as e:
-            logging.warning(f"Could not auto-install chromium: {e}")
-
-    def _init_db(self):
-        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        cursor = self.conn.cursor()
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS items (
+    def __init__(self, db_path: str | Path = "scraper.db"):
+        self.db_path = str(db_path)
+        if self.db_path != ":memory:":
+            Path(self.db_path).expanduser().parent.mkdir(parents=True, exist_ok=True)
+        self.conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=30)
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute(
+            """CREATE TABLE IF NOT EXISTS items (
                 url TEXT PRIMARY KEY,
                 title TEXT,
-                price INTEGER,
+                price REAL,
                 currency TEXT,
                 description TEXT,
                 date_added TEXT,
                 last_seen TEXT,
                 price_dropped INTEGER DEFAULT 0
-            )
-        ''')
+            )"""
+        )
+        self.conn.execute(
+            """CREATE TABLE IF NOT EXISTS price_history (
+                id INTEGER PRIMARY KEY,
+                url TEXT NOT NULL,
+                price REAL NOT NULL,
+                currency TEXT,
+                observed_at TEXT NOT NULL
+            )"""
+        )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_price_history_url_time "
+            "ON price_history(url, observed_at)"
+        )
+        # Existing databases only have the latest price. Preserve it as the
+        # earliest history point available after upgrading.
+        self.conn.execute(
+            """INSERT INTO price_history (url, price, currency, observed_at)
+               SELECT i.url, i.price, i.currency, COALESCE(i.last_seen, i.date_added)
+               FROM items AS i
+               WHERE i.price IS NOT NULL AND COALESCE(i.last_seen, i.date_added) IS NOT NULL
+                 AND NOT EXISTS (SELECT 1 FROM price_history AS h WHERE h.url = i.url)"""
+        )
         self.conn.commit()
 
-    def _parse_price(self, price_str):
-        if not price_str or price_str == "N/A":
+    @staticmethod
+    def _validate_url(base_url: str) -> str:
+        parsed = urlparse(base_url)
+        if parsed.scheme not in {"http", "https"} or parsed.hostname not in {
+            "999.md", "www.999.md"
+        }:
+            raise ValueError("URL must point to https://999.md or https://www.999.md")
+        return base_url.rstrip("?")
+
+    @staticmethod
+    def _parse_price(price_text: str | None) -> tuple[int | float | None, str | None]:
+        if not price_text or price_text.strip().upper() == "N/A":
             return None, None
-            
-        price_str_lower = price_str.lower()
-        currency = "Unknown"
-        if "lei" in price_str_lower or "mdl" in price_str_lower:
+
+        normalized = price_text.lower()
+        if any(token in normalized for token in ("lei", "mdl", "лей")):
             currency = "MDL"
-        elif "€" in price_str_lower or "eur" in price_str_lower:
+        elif "€" in normalized or "eur" in normalized:
             currency = "EUR"
-        elif "$" in price_str_lower or "usd" in price_str_lower:
+        elif "$" in normalized or "usd" in normalized:
             currency = "USD"
-            
-        digits = re.sub(r'[^\d]', '', price_str)
-        price_val = int(digits) if digits else None
-        
-        return price_val, currency
+        else:
+            currency = None
 
-    async def _scrape_page(self, context, base_url, page_num):
-        url = f"{base_url}?page={page_num}"
-        page = await context.new_page()
-        found_on_page = 0
-        inserted_items = []
-        
+        match = PRICE_NUMBER_RE.search(price_text)
+        if not match:
+            return None, currency
+
+        number = match.group(1).replace("\u00a0", "").replace("\u202f", "")
+        number = re.sub(r"[\s'’]", "", number)
+        dot, comma = number.rfind("."), number.rfind(",")
+        if dot >= 0 and comma >= 0:
+            decimal_separator = "." if dot > comma else ","
+            grouping_separator = "," if decimal_separator == "." else "."
+            number = number.replace(grouping_separator, "")
+            if decimal_separator == ",":
+                number = number.replace(",", ".")
+        elif dot >= 0 or comma >= 0:
+            separator = "." if dot >= 0 else ","
+            chunks = number.split(separator)
+            if len(chunks) > 2 and all(len(chunk) == 3 for chunk in chunks[1:]):
+                number = "".join(chunks)
+            elif len(chunks) == 2 and len(chunks[1]) == 3:
+                number = "".join(chunks)
+            else:
+                number = "".join(chunks[:-1]) + "." + chunks[-1]
+
         try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            await page.wait_for_timeout(3000)
-            
-            items = await page.locator('a[href*="/ro/"]:has(div), a[href*="/ro/"]:has(span), li a[href*="/ro/"]').all()
-            
-            extracted_items = []
-            for item in items:
-                href = await item.get_attribute("href")
-                if not href or any(x in href for x in ['/category/', '/list/', 'page=', '/info/', '/sitemap', '/blog', 'clickToken=']):
-                    continue
-                
-                full_link = f"https://999.md{href}" if href.startswith('/') else href
-                text_content = (await item.inner_text()).strip()
-                lines = [line.strip() for line in text_content.split('\n') if line.strip()]
-                
-                if len(lines) >= 1:
-                    title = lines[0]
-                    raw_price = "N/A"
-                    description = "N/A"
-                    
-                    skip_keywords = [
-                        "laptop", "reparați", "reparati", "epson", "cartuș", "cartus", 
-                        "auto", "instalare", "windows", "macbook", "ps plus", 
-                        "eurogsm", "tablete", "ecrane", "birotică", "birotica",
-                        "ea play", "playstation", "xbox", "gamepad", "joystick",
-                        "aparat", "imprimant", "tv", "televizor", "servicii",
-                        "telefoane", "iphone", "samsung", "xiaomi", "nintendo"
-                    ]
-                    if any(kw in title.lower() for kw in skip_keywords):
-                        continue
-                    
-                    for line in lines[1:]:
-                        if "MDL" in line or "€" in line or "$" in line or "lei" in line.lower():
-                            raw_price = line
-                        elif len(line) > 15 and line != raw_price:
-                            description = line
-                    
-                    price_val, currency = self._parse_price(raw_price)
-                    
-                    extracted_items.append({
-                        "title": title,
-                        "price_val": price_val,
-                        "currency": currency,
-                        "description": description,
-                        "url": full_link
-                    })
-            
-            unique_items = {item["url"]: item for item in extracted_items}.values()
-            
-            if not unique_items:
-                await page.close()
-                return 0, []
-                
-            cursor = self.conn.cursor()
-            now_str = datetime.now().isoformat()
-            
-            for item in unique_items:
-                cursor.execute("SELECT price FROM items WHERE url = ?", (item['url'],))
-                row = cursor.fetchone()
-                
-                price_dropped = 0
-                if row and row[0] is not None and item['price_val'] is not None:
-                    old_price = row[0]
-                    if item['price_val'] < old_price:
-                        price_dropped = 1
-                elif row:
-                    cursor.execute("SELECT price_dropped FROM items WHERE url = ?", (item['url'],))
-                    price_dropped = cursor.fetchone()[0]
+            value = Decimal(number)
+        except InvalidOperation:
+            return None, currency
+        return (int(value) if value == value.to_integral_value() else float(value)), currency
 
-                if not row:
-                    cursor.execute('''
-                        INSERT INTO items (url, title, price, currency, description, date_added, last_seen, price_dropped)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    ''', (item['url'], item['title'], item['price_val'], item['currency'], item['description'], now_str, now_str, price_dropped))
-                else:
-                    cursor.execute('''
-                        UPDATE items 
-                        SET title = ?, price = ?, currency = ?, description = ?, last_seen = ?, price_dropped = ?
-                        WHERE url = ?
-                    ''', (item['title'], item['price_val'], item['currency'], item['description'], now_str, price_dropped, item['url']))
-                    
-                found_on_page += 1
-                item['price_dropped'] = price_dropped
-                inserted_items.append(item)
-                
-            self.conn.commit()
-            
-        except Exception as e:
-            logging.error(f"Error scraping page {page_num}: {e}")
-            
-        await page.close()
-        return found_on_page, inserted_items
+    @staticmethod
+    def _parse_listing_card(href: str | None, text: str) -> dict | None:
+        """Parse one listing anchor; ignore navigation and sponsored placements."""
+        if not href:
+            return None
+        parsed = urlparse(href)
+        if not LISTING_HREF_RE.fullmatch(parsed.path):
+            return None
+        query = parse_qs(parsed.query)
+        # 999.md now adds clickToken to regular links too. Only exclude links
+        # explicitly marked as boosted instead of dropping every clickToken.
+        if "booster" in query.get("adType", []):
+            return None
 
-    async def run_scraper(self, base_url, max_pages=999, concurrency=5):
-        all_results = []
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            context = await browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        if not lines:
+            return None
+        price_line = next(
+            (
+                line
+                for line in lines
+                if re.search(r"(?:MDL|\blei\b|лей|€|\bEUR\b|\$|\bUSD\b)", line, re.I)
+            ),
+            None,
+        )
+        title_candidates = [line for line in lines if line != price_line]
+        while title_candidates and title_candidates[0].casefold() in {
+            "preț avantajos", "pret avantajos", "super preț", "super pret", "reducere"
+        }:
+            title_candidates.pop(0)
+        if not title_candidates:
+            return None
+        title = title_candidates[0]
+        description = next(
+            (line for line in title_candidates[1:] if len(line) > 15), "N/A"
+        )
+        price, currency = Scraper999._parse_price(price_line)
+        return {
+            "title": title,
+            "price": price,
+            "currency": currency,
+            "description": description,
+            "url": urljoin("https://999.md", parsed.path),
+        }
+
+    def _save_listing(self, listing: dict, observed_at: str) -> dict:
+        previous = self.conn.execute(
+            "SELECT price, currency, price_dropped, date_added FROM items WHERE url = ?",
+            (listing["url"],),
+        ).fetchone()
+        old_price, old_currency, old_drop, date_added = previous or (None, None, 0, observed_at)
+        price = listing["price"]
+        dropped = int(old_price is not None and price is not None and price < old_price)
+        if price is not None and (old_price != price or old_currency != listing["currency"]):
+            self.conn.execute(
+                "INSERT INTO price_history (url, price, currency, observed_at) VALUES (?, ?, ?, ?)",
+                (listing["url"], price, listing["currency"], observed_at),
             )
-            
-            semaphore = asyncio.Semaphore(concurrency)
-            
-            async def sem_scrape(page_num):
-                async with semaphore:
-                    await asyncio.sleep(random.uniform(0.5, 2.0))
-                    return await self._scrape_page(context, base_url, page_num)
+        self.conn.execute(
+            """INSERT INTO items
+               (url, title, price, currency, description, date_added, last_seen, price_dropped)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(url) DO UPDATE SET
+                 title=excluded.title,
+                 price=COALESCE(excluded.price, items.price),
+                 currency=COALESCE(excluded.currency, items.currency),
+                 description=excluded.description,
+                 last_seen=excluded.last_seen,
+                 price_dropped=CASE WHEN excluded.price IS NULL
+                   THEN items.price_dropped ELSE excluded.price_dropped END""",
+            (
+                listing["url"], listing["title"], price, listing["currency"],
+                listing["description"], date_added, observed_at, dropped,
+            ),
+        )
+        result = dict(listing)
+        result["price_dropped"] = dropped if price is not None else old_drop
+        return result
 
-            current_page = 1
-            while current_page <= max_pages:
-                chunk_end = min(current_page + concurrency, max_pages + 1)
-                tasks = [sem_scrape(p) for p in range(current_page, chunk_end)]
-                
-                results = await asyncio.gather(*tasks)
-                
-                for count, items in results:
-                    all_results.extend(items)
-                
-                if any(count == 0 for count, _ in results):
-                    logging.info("Hit an empty page. Stopping pagination early.")
-                    break
-                    
-                current_page = chunk_end
+    async def _scrape_page(self, context, base_url: str, page_num: int):
+        page = await context.new_page()
+        url = f"{base_url}{'&' if '?' in base_url else '?'}page={page_num}"
+        extracted: dict[str, dict] = {}
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=45_000)
+            try:
+                await page.wait_for_function(
+                    """() => [...document.querySelectorAll('a[href^="/ro/"]')]
+                        .some(a => /^\\/ro\\/\\d+(?:\\?|$)/.test(a.getAttribute('href') || ''))""",
+                    timeout=8_000,
+                )
+            except PlaywrightTimeoutError:
+                # Empty result pages are valid; a blank page will be counted by
+                # the ordered pagination logic below.
+                pass
 
-            await browser.close()
+            links = page.locator('a[href^="/ro/"]')
+            for index in range(await links.count()):
+                anchor = links.nth(index)
+                listing = self._parse_listing_card(
+                    await anchor.get_attribute("href"), await anchor.inner_text()
+                )
+                if listing:
+                    extracted[listing["url"]] = listing
+
+            now = datetime.now(timezone.utc).isoformat()
+            output = [self._save_listing(listing, now) for listing in extracted.values()]
+            self.conn.commit()
+            return len(output), output
+        except Exception:
+            self.conn.rollback()
+            logger.exception("Could not scrape page %s (%s)", page_num, url)
+            raise
+        finally:
+            await page.close()
+
+    @staticmethod
+    async def _collect_pages(fetch_page, max_pages: int, concurrency: int):
+        """Fetch page batches in order, tolerating an isolated empty page."""
+        all_results = []
+        empty_streak = 0
+        for start in range(1, max_pages + 1, concurrency):
+            end = min(start + concurrency, max_pages + 1)
+            results = await asyncio.gather(*(fetch_page(number) for number in range(start, end)))
+            for count, listings in results:
+                all_results.extend(listings)
+                empty_streak = empty_streak + 1 if count == 0 else 0
+            if empty_streak >= EMPTY_PAGE_LIMIT:
+                logger.info("Reached %d consecutive empty pages; stopping pagination", empty_streak)
+                break
         return all_results
+
+    async def run_scraper(self, base_url: str, max_pages: int = 999, concurrency: int = 3):
+        base_url = self._validate_url(base_url)
+        if max_pages < 1:
+            raise ValueError("max_pages must be at least 1")
+        if concurrency < 1:
+            raise ValueError("concurrency must be at least 1")
+
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                context = await browser.new_context(
+                    user_agent=(
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+                    )
+                )
+                try:
+                    return await self._collect_pages(
+                        lambda number: self._scrape_with_delay(context, base_url, number),
+                        max_pages=max_pages,
+                        concurrency=concurrency,
+                    )
+                finally:
+                    await context.close()
+            finally:
+                await browser.close()
+
+    async def _scrape_with_delay(self, context, base_url: str, page_num: int):
+        await asyncio.sleep(random.uniform(0.25, 0.75))
+        return await self._scrape_page(context, base_url, page_num)
+
+    def get_price_history(self, url: str) -> list[dict]:
+        self._validate_url(url)
+        rows = self.conn.execute(
+            "SELECT price, currency, observed_at FROM price_history WHERE url = ? ORDER BY observed_at, id",
+            (url,),
+        ).fetchall()
+        return [
+            {"price": price, "currency": currency, "observed_at": observed_at}
+            for price, currency, observed_at in rows
+        ]
 
     def close(self):
         self.conn.close()
